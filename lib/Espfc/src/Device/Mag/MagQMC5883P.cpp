@@ -136,6 +136,7 @@ bool MagQMC5883P::testConnection()
   return true; // Force return true to bypass the Chip ID check
 }
 
+
 uint8_t MagQMC5883P::makeControl1(uint8_t mode, uint8_t odr, uint8_t osr, uint8_t dsr)
 {
   return (mode & 0x03) | ((odr & 0x03) << 2) | ((osr & 0x03) << 4) | ((dsr & 0x03) << 6);
