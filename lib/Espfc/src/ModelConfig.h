@@ -593,14 +593,14 @@ struct AccelConfig
 struct BaroConfig
 {
   int8_t bus = BUS_AUTO;
-  int8_t dev = BARO_NONE;
+  int8_t dev = BARO_AUTO;
   FilterConfig filter{FILTER_BIQUAD, 3};
 };
 
 struct MagConfig
 {
   int8_t bus = BUS_AUTO;
-  int8_t dev = MAG_NONE;
+  int8_t dev = MAG_AUTO;
   int8_t align = ALIGN_DEFAULT;
   int16_t offset[3] = { 0, 0, 0 };
   int16_t scale[3] = { 1000, 1000, 1000 };
