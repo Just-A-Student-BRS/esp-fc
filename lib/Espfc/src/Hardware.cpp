@@ -57,6 +57,8 @@ Hardware::Hardware(Model& model): _model(model) {}
 
 int Hardware::begin()
 {
+  _model.config.baro.dev = 1;; // Forces Barometer to Auto-detect on every boot
+  _model.config.mag.dev = 1; // 1 is almost certainly the integer value for MAG_AUTO
   initBus();
   detectGyro();
   detectMag();
