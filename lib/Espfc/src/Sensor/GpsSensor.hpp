@@ -1,6 +1,6 @@
 #pragma once
 
-#include "Sensor.hpp"
+#include "../Sensor.hpp"
 #include "Device/SerialDevice.hpp"
 #include "Gps.hpp"
 
