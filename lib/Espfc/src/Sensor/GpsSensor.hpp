@@ -1,118 +1,71 @@
 #pragma once
 
-#include "Device/SerialDevice.h"
-#include "Model.h"
-#include "Utils/Timer.h"
-#include <GpsParser.hpp>
-#include <cstring>
+#include "Sensor.hpp"
+#include "Device/SerialDevice.hpp"
+#include "Gps.hpp"
 
 namespace Espfc::Sensor {
 
-class GpsSensor
+class GpsSensor : public Sensor
 {
 public:
   GpsSensor(Model& model);
 
-  int begin(Device::SerialDevice* port, int baud);
+  int begin(Device::SerialDevice* port, int baud) override;
+  int update() override;
 
-  int update();
-
-private:
   void calculateHomeVector() const;
 
-  enum State
-  {
-    DETECT_BAUD,
-    GET_VERSION,
-    CONFIGURE_BAUD,
-    DISABLE_NMEA,
-    ENABLE_UBX,
-    ENABLE_NAV5,
-    ENABLE_SBAS,
-    DETECT_GPS_L5,
-    CONFIGURE_GNSS,
-    CONFIGURE_NAV_RATE,
-    WAIT,
-    RECEIVE,
-    ERROR,
-  };
-
-  void handle();
-
+private:
+  bool processNmea(uint8_t c);
   bool processUbx(uint8_t c);
-  void processNmea(uint8_t c);
-  void setBaud(int baud);
 
   void onMessage();
-
-  template<typename MsgType>
-  void send(const MsgType& m, State ackState, State timeoutState = ERROR)
-  {
-    Gps::UbxFrame<MsgType> frame{m};
-    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&frame);
-    _port->write(ptr, sizeof(frame));
-
-    setState(WAIT, ackState, timeoutState);
-  }
-
-  void send(const Gps::UbxRequest& m, State ackState, State timeoutState = ERROR)
-  {
-    Gps::UbxFrame<Gps::UbxRequest> frame{m};
-    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&frame);
-    _port->write(ptr, frame.size());
-
-    setState(WAIT, ackState, timeoutState);
-  }
-
-  bool isLegacyProto() const
-  {
-    return _model.state.gps.support.protVerMajor < 27;
-  }
-
-  void setState(State state, State ackState, State timeoutState);
-  void setState(State state);
-
-  void handleError();
-  void handleNavPvt() const;
-  void handleNavSat() const;
-  void handleVersion() const;
+  void handle();
   void handleReceive();
-  void handleCfgValGet() const;
-
-  void checkSupport(const char* payload) const;
-
   void detectBaud();
+  void readVersion();
   void configureBaud();
   void disableNmea();
-  void readVersion();
   void enableUbx();
   void enableNav5();
   void enableSbas();
   void detectGpsL5();
-  void configureGnss();
   void configureRate();
+  void configureGnss();
+  void setBaud(int baud);
+  void setState(State state, State ackState, State timeoutState);
+  void setState(State state);
+  void handleError();
+  void handleCfgValGet() const;
+  void handleNavPvt() const;
+  void handleNavSat() const;
+  void handleVersion() const;
+  void checkSupport(const char* payload) const;
 
-  static constexpr uint32_t TIMEOUT = 300000;
-  static constexpr uint32_t DETECT_TIMEOUT = 2200000;
-
-  Model& _model;
-
-  State _state = WAIT;
-  State _ackState = WAIT;
-  State _timeoutState = DETECT_BAUD;
-  size_t _counter = 0;
-  uint32_t _timeout = 0;
-  int _currentBaud = 0;
-  int _targetBaud = 0;
-
-  Gps::UbxParser _ubxParser;
-  Gps::UbxMessage _ubxMsg;
-
-  Gps::NmeaParser _nmeaParser;
-  Gps::NmeaMessage _nmeaMsg;
+  bool isLegacyProto() const { return _model.state.gps.support.version < GPS_M10; }
+  void send(const auto& msg, State nextState, State timeoutState)
+  {
+    _ubxMsg = Gps::UbxMessage();
+    _port->write(msg.getData(), msg.getSize());
+    setState(nextState, nextState, timeoutState);
+  }
+  void send(const auto& msg, State nextState)
+  {
+    send(msg, nextState, ERROR);
+  }
 
   Device::SerialDevice* _port;
-  Utils::Timer _timer;
+  Gps::UbxParser _ubxParser;
+  Gps::UbxMessage _ubxMsg;
+  Gps::NmeaMessage _nmeaMsg;
+  uint32_t _timeout;
+  int _targetBaud;
+  int _currentBaud;
+  State _ackState;
+  State _timeoutState;
+  uint8_t _counter;
+  uint8_t _fixHoldCounter;
 };
 
 } // namespace Espfc::Sensor
