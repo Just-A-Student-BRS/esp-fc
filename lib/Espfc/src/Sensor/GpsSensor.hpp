@@ -1,7 +1,10 @@
 #pragma once
-
-#include "../Sensor.hpp"
-#include "Device/SerialDevice.hpp"
+#include "Sensor/BaseSensor.hpp"
+#include "Device/SerialDevice.h"
+#include "Model.h"
+#include "Utils/Timer.h"
+#include <GpsParser.hpp>
+#include <cstring>
 #include "Gps.hpp"
 
 namespace Espfc::Sensor {
