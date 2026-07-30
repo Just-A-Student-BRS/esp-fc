@@ -1,12 +1,12 @@
 #pragma once
 
 #include "Sensor/BaseSensor.hpp"
-#include "Device/SerialDevice.hpp"
+#include "../Device/SerialDevice.hpp"
 #include "Gps.hpp"
 
 namespace Espfc::Sensor {
 
-class GpsSensor : public Sensor
+class GpsSensor : public BaseSensor
 {
 public:
   GpsSensor(Model& model);
@@ -52,7 +52,7 @@ private:
   }
   void send(const auto& msg, State nextState)
   {
-    send(msg, nextState, ERROR);
+    send(nextState, nextState, ERROR);
   }
 
   Device::SerialDevice* _port;
