@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Sensor/BaseSensor.hpp"
-#include "../Device/SerialDevice.hpp"
+#include "../../Device/SerialDevice.hpp"
 #include "Gps.hpp"
 
 namespace Espfc::Sensor {
