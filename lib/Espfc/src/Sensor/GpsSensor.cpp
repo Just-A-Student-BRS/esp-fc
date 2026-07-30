@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <tuple>
-#include <cstring>
 
 namespace Espfc::Sensor {
 
@@ -21,16 +20,18 @@ static constexpr std::array<std::tuple<uint16_t, uint8_t>, 2> UBX_MSG_ON{{
     {Gps::UBX_NAV_SAT, 10u},
 }};
 
-GpsSensor::GpsSensor(Model& model): _model(model), _fixHoldCounter(0) {}
+GpsSensor::GpsSensor(Model& model): _model(model) {}
 
 int GpsSensor::begin(Device::SerialDevice* port, int baud)
 {
   _port = port;
-  _targetBaud = _currentBaud = 9600;
+  _targetBaud = _currentBaud = baud;
   _timer.setRate(50);
 
-  _state = GpsSensor::RECEIVE; // Skip detection loops and stay in RECEIVE state
-  setBaud(9600);
+  _state = DETECT_BAUD;
+  _timeout = micros() + DETECT_TIMEOUT;
+  _counter = 0;
+  setBaud(_targetBaud);
 
   return 1;
 }
@@ -50,20 +51,12 @@ int GpsSensor::update()
   {
     for (size_t i = 0; i < read; i++)
     {
-      updated |= processNmea(buff[i]);            // Processes NMEA sentences and extracts coordinates, fix, alt, speed, heading
+      updated |= processUbx(buff[i]);
+      processNmea(buff[i]); // FIXED: Removed 'updated |='
     }
   }
 
-  // Real-time status update: light up icon if valid data or bytes flow, turn grey if disconnected
-  if (updated || read > 0)
-  {
-    _model.state.gps.present = true;
-    _state = GpsSensor::RECEIVE;
-  }
-  else
-  {
-    _model.state.gps.present = false;
-  }
+  if (!updated) handle();
 
   return 1;
 }
@@ -81,130 +74,30 @@ bool GpsSensor::processUbx(uint8_t c)
   return true;
 }
 
-bool GpsSensor::processNmea(uint8_t c)
+void GpsSensor::processNmea(uint8_t c) // FIXED: Ensures this is 'void'
 {
-  static char line[128];
-  static uint8_t idx = 0;
-  bool parsed = false;
+  _nmeaParser.parse(c, _nmeaMsg);
+  if (!_nmeaMsg.isReady()) return;
 
-  if (c == '$') {
-    idx = 0;
-    line[idx++] = c;
-  } else if (c == '\r' || c == '\n') {
-    if (idx > 6) {
-      line[idx] = '\0';
-      
-      // Check for frame error text log
-      static const char* txtMsg = "GNTXT,01,01,01,More than 100 frame errors";
-      if (!_model.state.gps.frameError && std::strncmp(_nmeaMsg.payload, txtMsg, std::strlen(txtMsg)) == 0)
-      {
-        _model.state.gps.frameError = true;
-        if (!_model.isModeActive(MODE_ARMED)) _model.logger.err().logln("GPS RX Frame Err");
-      }
+  //$GNTXT,01,01,01,More than 100 frame errors, UART RX was disabled*70
+  static const char* msg = "GNTXT,01,01,01,More than 100 frame errors";
 
-      // 1. Parse GPGGA / GNGGA (Position, Fix, Satellites, Altitude)
-      if (std::strncmp(line, "$GPGGA", 6) == 0 || std::strncmp(line, "$GNGGA", 6) == 0) {
-        char *p = line;
-        int field = 0;
-        double raw_lat = 0, raw_lon = 0, alt = 0;
-        int sats = 0;
-        int fix = 0;
-
-        while ((p = std::strchr(p, ',')) != NULL) {
-          p++;
-          field++;
-          if (field == 2) raw_lat = std::atof(p);       // Raw Latitude (DDMM.MMMM)
-          else if (field == 4) raw_lon = std::atof(p);  // Raw Longitude (DDDMM.MMMM)
-          else if (field == 6) fix = std::atoi(p);      // Fix quality
-          else if (field == 7) sats = std::atoi(p);     // Satellite count
-          else if (field == 9) alt = std::atof(p);      // Altitude MSL (meters)
-        }
-
-        if (fix > 0 && raw_lat != 0.0 && raw_lon != 0.0) {
-          int deg_lat = (int)(raw_lat / 100.0);
-          double min_lat = raw_lat - (deg_lat * 100.0);
-          double dec_lat = deg_lat + (min_lat / 60.0);
-
-          int deg_lon = (int)(raw_lon / 100.0);
-          double min_lon = raw_lon - (deg_lon * 100.0);
-          double dec_lon = deg_lon + (min_lon / 60.0);
-
-          int32_t lat_scaled = (int32_t)(dec_lat * 10000000.0);
-          int32_t lon_scaled = (int32_t)(dec_lon * 10000000.0);
-
-          // Position Smoothing Filter (EMA): Prevent random 100m jumps
-          static int32_t smoothed_lat = 0;
-          static int32_t smoothed_lon = 0;
-
-          if (smoothed_lat == 0 || smoothed_lon == 0) {
-            smoothed_lat = lat_scaled;
-            smoothed_lon = lon_scaled;
-          } else {
-            smoothed_lat = smoothed_lat + (int32_t)((float)(lat_scaled - smoothed_lat) * 0.1f);
-            smoothed_lon = smoothed_lon + (int32_t)((float)(lon_scaled - smoothed_lon) * 0.1f);
-          }
-
-          _model.state.gps.location.raw.lat = smoothed_lat;
-          _model.state.gps.location.raw.lon = smoothed_lon;
-          _model.state.gps.numSats = sats;
-          _model.state.gps.fixType = fix;
-          _model.state.gps.accuracy.horizontal = (sats >= 4) ? 100 : 999;
-          _model.state.gps.location.raw.height = (int32_t)(alt * 1000.0f); // Meters to millimeters
-
-          _fixHoldCounter = 15; // Hold state stable for 15 valid cycles
-          calculateHomeVector();
-          parsed = true;
-        }
-      }
-      
-      // 2. Parse GPVTG / GNVTG (Ground Speed and Heading)
-      else if (std::strncmp(line, "$GPVTG", 6) == 0 || std::strncmp(line, "$GNVTG", 6) == 0) {
-        char *p = line;
-        int field = 0;
-        float course = 0;
-        float speed_kmh = 0;
-
-        while ((p = std::strchr(p, ',')) != NULL) {
-          p++;
-          field++;
-          if (field == 1) course = std::atof(p);         // Heading in degrees
-          else if (field == 7) speed_kmh = std::atof(p); // Speed in km/h
-        }
-
-        uint32_t speed_mmps = (uint32_t)((speed_kmh / 3.6f) * 1000.0f); // km/h to mm/s
-        if (speed_mmps < 50) {
-          speed_mmps = 0; // Deadband filter for stationary noise
-        }
-
-        _model.state.gps.velocity.raw.groundSpeed = speed_mmps;
-        _model.state.gps.velocity.raw.heading = (int32_t)(course * 100000.0f); // deg * 1e5
-
-        parsed = true;
-      }
-    }
-    idx = 0;
-  } else if (idx < sizeof(line) - 1) {
-    line[idx++] = c;
-  } else {
-    idx = 0;
+  if (!_model.state.gps.frameError && std::strncmp(_nmeaMsg.payload, msg, std::strlen(msg)) == 0)
+  {
+    _model.state.gps.frameError = true;
+    if (!_model.isModeActive(MODE_ARMED)) _model.logger.err().logln("GPS RX Frame Err");
   }
 
-  // Bind fix state directly to active coordinate validation and hold counter
-  if (_fixHoldCounter > 0 && _model.state.gps.location.raw.lat != 0) {
-    _fixHoldCounter--;
-    _model.state.gps.fix = true;
-  } else {
-    _model.state.gps.fix = false;
-  }
+  onMessage();
 
-  return parsed;
+  _nmeaMsg = Gps::NmeaMessage();
 }
 
 void GpsSensor::onMessage()
 {
-  if (_state == GpsSensor::DETECT_BAUD)
+  if (_state == DETECT_BAUD)
   {
-    _state = GpsSensor::GET_VERSION;
+    _state = GET_VERSION;
     _model.logger.info().log(F("GPS DET")).logln(_currentBaud);
   }
 }
@@ -213,52 +106,52 @@ void GpsSensor::handle()
 {
   switch (_state)
   {
-    case GpsSensor::DETECT_BAUD:
+    case DETECT_BAUD:
       detectBaud();
       break;
 
-    case GpsSensor::GET_VERSION:
+    case GET_VERSION:
       readVersion();
       break;
 
-    case GpsSensor::CONFIGURE_BAUD:
+    case CONFIGURE_BAUD:
       configureBaud();
       break;
 
-    case GpsSensor::DISABLE_NMEA:
+    case DISABLE_NMEA:
       disableNmea();
       break;
 
-    case GpsSensor::ENABLE_UBX:
+    case ENABLE_UBX:
       enableUbx();
       break;
 
-    case GpsSensor::ENABLE_NAV5:
+    case ENABLE_NAV5:
       enableNav5();
       break;
 
-    case GpsSensor::ENABLE_SBAS:
+    case ENABLE_SBAS:
       enableSbas();
       break;
 
-    case GpsSensor::DETECT_GPS_L5:
+    case DETECT_GPS_L5:
       detectGpsL5();
       break;
 
-    case GpsSensor::CONFIGURE_GNSS:
+    case CONFIGURE_GNSS:
       configureGnss();
       break;
 
-    case GpsSensor::CONFIGURE_NAV_RATE:
+    case CONFIGURE_NAV_RATE:
       configureRate();
       break;
 
-    case GpsSensor::ERROR:
+    case ERROR:
       handleError();
       break;
 
-    case GpsSensor::RECEIVE:
-    case GpsSensor::WAIT:
+    case RECEIVE:
+    case WAIT:
     default:
       handleReceive();
       break;
@@ -267,7 +160,7 @@ void GpsSensor::handle()
 
 void GpsSensor::handleReceive()
 {
-  if (_state == GpsSensor::RECEIVE)
+  if (_state == RECEIVE)
   {
     _model.state.gps.present = true;
   }
@@ -304,8 +197,9 @@ void GpsSensor::handleReceive()
       handleNavSat();
     }
   }
-  else if (_state == GpsSensor::WAIT && micros() > _timeout)
+  else if (_state == WAIT && micros() > _timeout)
   {
+    // timeout
     _state = _timeoutState;
     _model.state.gps.present = false;
     _model.logger.err().logln(F("GPS TOUT"));
@@ -316,6 +210,7 @@ void GpsSensor::detectBaud()
 {
   if (micros() > _timeout)
   {
+    // on timeout check next baud
     if (_counter < BAUDS.size())
     {
       setBaud(BAUDS[_counter]);
@@ -323,7 +218,8 @@ void GpsSensor::detectBaud()
     }
     else
     {
-      _state = GpsSensor::ERROR;
+      _state = ERROR; // detection falied, give up
+      // _state = DETECT_BAUD; // restart detection if all baud rates failed
       _counter = 0;
       setBaud(_targetBaud);
     }
@@ -333,7 +229,7 @@ void GpsSensor::detectBaud()
 
 void GpsSensor::readVersion()
 {
-  send(Gps::UbxMonVer{}, GpsSensor::CONFIGURE_BAUD);
+  send(Gps::UbxMonVer{}, CONFIGURE_BAUD); // version handled in WAIT/RECEIVE
   _timeout = micros() + 3 * TIMEOUT;
 }
 
@@ -346,23 +242,23 @@ void GpsSensor::configureBaud()
             .portId = 1,
             .resered1 = 0,
             .txReady = 0,
-            .mode = 0x08c0,
-            .baudRate = (uint32_t)_targetBaud,
+            .mode = 0x08c0,                    // 8N1
+            .baudRate = (uint32_t)_targetBaud, // baud
             .inProtoMask = 0x07,
             .outProtoMask = 0x07,
             .flags = 0,
             .resered2 = 0,
         },
-        GpsSensor::DISABLE_NMEA, GpsSensor::DISABLE_NMEA);
+        DISABLE_NMEA, DISABLE_NMEA); // we may not be able to receive ACK for this message
   }
   else
   {
     Gps::UbxRequest req(Gps::UBX_CFG_VALSET);
-    req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01});
+    req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01}); // RAM only
     req.write(Gps::UbxCfgValsetItem<Gps::CFG_UART1_BAUDRATE, uint32_t>(_targetBaud));
-    send(req, GpsSensor::DISABLE_NMEA, GpsSensor::DISABLE_NMEA);
+    send(req, DISABLE_NMEA, DISABLE_NMEA);
   }
-  delay(30);
+  delay(30); // wait until transmission complete at 9600bps in worst case
   setBaud(_targetBaud);
   delay(5);
 }
@@ -383,21 +279,21 @@ void GpsSensor::disableNmea()
     else
     {
       _counter = 0;
-      send(m, GpsSensor::ENABLE_UBX);
+      send(m, ENABLE_UBX);
       _model.logger.info().logln(F("GPS NMEA OFF"));
     }
   }
   else
   {
     Gps::UbxRequest req(Gps::UBX_CFG_VALSET);
-    req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01});
+    req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01}); // RAM only
     req.write(Gps::UbxCfgValsetItem<Gps::CFG_MSGOUT_NMEA_GGA_UART1, bool>(0));
     req.write(Gps::UbxCfgValsetItem<Gps::CFG_MSGOUT_NMEA_GLL_UART1, bool>(0));
     req.write(Gps::UbxCfgValsetItem<Gps::CFG_MSGOUT_NMEA_GSA_UART1, bool>(0));
     req.write(Gps::UbxCfgValsetItem<Gps::CFG_MSGOUT_NMEA_GSV_UART1, bool>(0));
     req.write(Gps::UbxCfgValsetItem<Gps::CFG_MSGOUT_NMEA_RMC_UART1, bool>(0));
     req.write(Gps::UbxCfgValsetItem<Gps::CFG_MSGOUT_NMEA_VTG_UART1, bool>(0));
-    send(req, GpsSensor::ENABLE_UBX);
+    send(req, ENABLE_UBX);
     _model.logger.info().logln(F("GPS NMEA* OFF"));
   }
 }
@@ -417,7 +313,7 @@ void GpsSensor::enableUbx()
     }
     else
     {
-      send(m, GpsSensor::ENABLE_NAV5);
+      send(m, ENABLE_NAV5);
       _counter = 0;
       _timeout = micros() + 10 * TIMEOUT;
       _model.logger.info().logln(F("GPS UBX ON"));
@@ -426,10 +322,10 @@ void GpsSensor::enableUbx()
   else
   {
     Gps::UbxRequest req(Gps::UBX_CFG_VALSET);
-    req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01});
+    req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01}); // RAM only
     req.write(Gps::UbxCfgValsetItem<Gps::CFG_MSGOUT_UBX_NAV_PVT_UART1, uint8_t>(1));
     req.write(Gps::UbxCfgValsetItem<Gps::CFG_MSGOUT_UBX_NAV_SAT_UART1, uint8_t>(10));
-    send(req, GpsSensor::ENABLE_NAV5);
+    send(req, ENABLE_NAV5); // if supported we get ACK, then go to get_version, else try legacy disable_nmea commands
     _model.logger.info().logln(F("GPS UBX* ON"));
   }
 }
@@ -440,8 +336,8 @@ void GpsSensor::enableNav5()
   {
     send(
         Gps::UbxCfgNav5{
-            .mask = {.value = 0xffff},
-            .dynModel = 8,
+            .mask = {.value = 0xffff}, // all
+            .dynModel = 8,             // airborne
             .fixMode = 3,
             .fixedAlt = 0,
             .fixedAltVar = 10000,
@@ -460,15 +356,15 @@ void GpsSensor::enableNav5()
             .utcStandard = 0,
             .reserved1 = {0, 0, 0, 0, 0},
         },
-        GpsSensor::ENABLE_SBAS);
+        ENABLE_SBAS);
     _model.logger.info().logln(F("GPS NAV5"));
   }
   else
   {
     Gps::UbxRequest req(Gps::UBX_CFG_VALSET);
-    req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01});
-    req.write(Gps::UbxCfgValsetItem<Gps::CFG_NAVSPG_DYNMODEL, uint8_t>(8));
-    send(req, GpsSensor::ENABLE_SBAS);
+    req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01});       // RAM only
+    req.write(Gps::UbxCfgValsetItem<Gps::CFG_NAVSPG_DYNMODEL, uint8_t>(8)); // airborne
+    send(req, ENABLE_SBAS);
     _model.logger.info().logln(F("GPS NAVSPG*"));
   }
 }
@@ -487,37 +383,38 @@ void GpsSensor::enableSbas()
               .scanmode2 = 0,
               .scanmode1 = 0,
           },
-          GpsSensor::DETECT_GPS_L5);
+          DETECT_GPS_L5);
       _model.logger.info().logln(F("GPS SBAS"));
     }
     else
     {
       Gps::UbxRequest req(Gps::UBX_CFG_VALSET);
-      req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01});
-      req.write(Gps::UbxCfgValsetItem<Gps::CFG_SBAS_PRNSCANMASK, uint64_t>(0));
-      send(req, GpsSensor::DETECT_GPS_L5);
+      req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01});         // RAM only
+      req.write(Gps::UbxCfgValsetItem<Gps::CFG_SBAS_PRNSCANMASK, uint64_t>(0)); // all
+      send(req, DETECT_GPS_L5);
       _model.logger.info().logln(F("GPS SBAS*"));
     }
   }
   else
   {
-    setState(GpsSensor::DETECT_GPS_L5);
+    setState(DETECT_GPS_L5);
   }
 }
 
 void GpsSensor::detectGpsL5()
 {
   Gps::UbxRequest req(Gps::UBX_CFG_VALGET);
-  req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01});
+  req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01}); // RAM only
   req.write(Gps::CFG_SIGNAL_GPS_L5);
-  send(req, GpsSensor::CONFIGURE_GNSS, GpsSensor::CONFIGURE_GNSS);
+  send(req, CONFIGURE_GNSS, CONFIGURE_GNSS); // if supported we get ACK with value, else timeout and continue with GNSS
+                                             // configuration without L5 support
 }
 
 void GpsSensor::configureRate()
 {
   uint16_t mRate = 200;
   if (_currentBaud > 100000) mRate = 100;
-  if (_model.state.gps.support.version == GPS_M10 && _currentBaud > 200000) mRate = 40;
+  if (_model.state.gps.support.version == GPS_M10 && _currentBaud > 200000) mRate = 40; // (proto<24 => >50ms)
   const uint16_t nRate = 1;
 
   if (isLegacyProto())
@@ -525,19 +422,19 @@ void GpsSensor::configureRate()
     const Gps::UbxCfgRate6 m{
         .measRate = mRate,
         .navRate = nRate,
-        .timeRef = 0,
+        .timeRef = 0, // utc
     };
-    send(m, GpsSensor::RECEIVE);
+    send(m, RECEIVE);
     _model.logger.info().log(F("GPS NAVRATE")).log(mRate).log(nRate).logln(1000 / mRate);
   }
   else
   {
     Gps::UbxRequest req(Gps::UBX_CFG_VALSET);
-    req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01});
+    req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01}); // RAM only
     req.write(Gps::UbxCfgValsetItem<Gps::CFG_RATE_MEAS, uint16_t>(mRate));
     req.write(Gps::UbxCfgValsetItem<Gps::CFG_RATE_NAV, uint16_t>(nRate));
-    req.write(Gps::UbxCfgValsetItem<Gps::CFG_RATE_TIMEREF, uint8_t>(0));
-    send(req, GpsSensor::RECEIVE);
+    req.write(Gps::UbxCfgValsetItem<Gps::CFG_RATE_TIMEREF, uint8_t>(0)); // utc
+    send(req, RECEIVE);
     _model.logger.info().log(F("GPS NAVRATE*")).log(mRate).log(nRate).logln(1000 / mRate);
   }
 }
@@ -670,12 +567,12 @@ void GpsSensor::configureGnss()
       written += req.write(Gps::UbxCfgGnssBlock{
           .gnssId = 6, .resTrkCh = 8, .maxTrkCh = 14, .flagsEnable = enableGLO, .sigCfgMask = 0x01, .flagsHigh = 0x01});
     }
-    send(req, GpsSensor::CONFIGURE_NAV_RATE);
+    send(req, CONFIGURE_NAV_RATE);
   }
   else
   {
     Gps::UbxRequest req{Gps::UBX_CFG_VALSET};
-    written += req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01});
+    written += req.write(Gps::UbxCfgValsetHeader{.version = 0, .layers = 0x01}); // RAM only
     if (_model.state.gps.support.gps)
     {
       written += req.write(Gps::UbxCfgValsetItem<Gps::CFG_SIGNAL_GPS_ENA, bool>(enableGPS));
@@ -704,7 +601,7 @@ void GpsSensor::configureGnss()
     {
       written += req.write(Gps::UbxCfgValsetItem<Gps::CFG_SIGNAL_GPS_L5, bool>(useDualBand));
     }
-    send(req, GpsSensor::CONFIGURE_NAV_RATE);
+    send(req, CONFIGURE_NAV_RATE);
   }
 
   _model.logger.info().log(F("GPS GNSS"));
@@ -753,22 +650,59 @@ void GpsSensor::handleNavPvt() const
 {
   const auto& m = *_ubxMsg.getAs<Gps::UbxNavPvt92>();
 
-  _model.state.gps.fix = m.fixType == 3 && m.flags.gnssFixOk;
+  // --- 1. ICON BLINKING FIX (Debounce) ---
+  static uint8_t fix_hold_counter = 0;
+  bool current_fix = m.fixType == 3 && m.flags.gnssFixOk;
+
+  // Reset the hold counter whenever a valid 3D fix with actual coordinates arrives
+  if (current_fix && m.lat != 0) {
+    fix_hold_counter = 15;
+  }
+
+  // Update the fix state based on the hold counter, preventing single-frame UI drops
+  if (fix_hold_counter > 0) {
+    fix_hold_counter--;
+    _model.state.gps.fix = true;
+  } else {
+    _model.state.gps.fix = false;
+  }
+
   _model.state.gps.fixType = m.fixType;
   _model.state.gps.numSats = m.numSV;
 
   _model.state.gps.accuracy.pDop = m.pDOP;
-  _model.state.gps.accuracy.horizontal = m.hAcc;
-  _model.state.gps.accuracy.vertical = m.vAcc;
-  _model.state.gps.accuracy.speed = m.sAcc;
-  _model.state.gps.accuracy.heading = m.headAcc;
+  _model.state.gps.accuracy.horizontal = m.hAcc; // mm
+  _model.state.gps.accuracy.vertical = m.vAcc;   // mm
+  _model.state.gps.accuracy.speed = m.sAcc;      // mm/s
+  _model.state.gps.accuracy.heading = m.headAcc; // deg * 1e5
 
-  _model.state.gps.location.raw.lat = m.lat;
-  _model.state.gps.location.raw.lon = m.lon;
+
+  // --- 2. PRECISION FIX (EMA Filter) ---
+  static int32_t smoothed_lat = 0;
+  static int32_t smoothed_lon = 0;
+
+  if (smoothed_lat == 0 || smoothed_lon == 0) {
+    smoothed_lat = m.lat;
+    smoothed_lon = m.lon;
+  } else if (m.lat != 0 && m.lon != 0) {
+    // 10% new reading, 90% old reading to stop stationary drifting
+    smoothed_lat = smoothed_lat + (int32_t)((float)(m.lat - smoothed_lat) * 0.1f);
+    smoothed_lon = smoothed_lon + (int32_t)((float)(m.lon - smoothed_lon) * 0.1f);
+  }
+
+  _model.state.gps.location.raw.lat = smoothed_lat;
+  _model.state.gps.location.raw.lon = smoothed_lon;
   _model.state.gps.location.raw.height = m.hSML;
 
-  _model.state.gps.velocity.raw.groundSpeed = m.gSpeed;
+
+  // --- 3. SPEED DEADBAND FILTER ---
+  uint32_t speed_mmps = m.gSpeed;
+  if (speed_mmps < 50) { // Zero out random noise under ~0.18 km/h while stationary
+    speed_mmps = 0;
+  }
+  _model.state.gps.velocity.raw.groundSpeed = speed_mmps;
   _model.state.gps.velocity.raw.heading = m.headMot;
+
 
   _model.state.gps.velocity.raw.north = m.velN;
   _model.state.gps.velocity.raw.east = m.velE;
